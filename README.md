@@ -69,15 +69,19 @@ paths. `pkg/` is a build artifact and is not committed to this repository.
 ## Usage as an npm package
 
 The `pkg/` directory produced by the build is a ready-to-publish npm
-package (`gpuatlas`). After installing it:
+package (`@givemegohan/gpuatlas`). After installing it:
 
 ```js
-import init, { create_viewer, create_headless } from "gpuatlas";
+import init, { create_viewer, create_headless } from "@givemegohan/gpuatlas";
 
 await init(); // loads the .wasm
 // create_viewer(canvas, ...) starts the interactive viewer;
 // create_headless(...) runs the simulation without a canvas.
 ```
+
+To publish: `npm publish --access=public` inside `pkg/` (the scope is
+required — npm rejects the unscoped name as too similar to the existing
+`gpu-atlas` package; `build.sh` already writes the scoped name).
 
 `index.html` in this repository is the reference integration: it wires the
 viewer to the control bar, the file loader (`data.mjs`) and the image

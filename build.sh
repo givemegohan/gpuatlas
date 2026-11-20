@@ -30,6 +30,11 @@ export RUSTFLAGS="$REMAP"
 # Web build -> pkg/ (.wasm + JS glue), loaded by index.html.
 wasm-pack build --release --target web --out-dir pkg
 
+# The npm package is published under a scope: the unscoped name "gpuatlas"
+# is rejected by npm as too similar to the existing "gpu-atlas" package.
+# wasm-pack writes the bare crate name, so rewrite it here.
+sed -i 's/"name": "gpuatlas"/"name": "@givemegohan\/gpuatlas"/' pkg/package.json
+
 # Native headless benchmark binary (target/release/bench).
 cargo build --release --bin bench
 
