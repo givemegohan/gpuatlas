@@ -1,0 +1,9 @@
+# Build artifacts
+target/
+pkg/
+toolchain/
+node_modules/
+
+# Logs and editor/OS noise
+*.log
+.DS_Store

@@ -1,0 +1,1049 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>gpuatlas — Rust + wgpu (WebGPU) 版</title>
+<style>
+  html, body { margin: 0; height: 100%; font-family: sans-serif; background: #10131a; }
+  #bar {
+    display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
+    padding: 8px 12px; background: #222; color: #eee; font-size: 13px;
+  }
+  #bar label { display: flex; gap: 6px; align-items: center; }
+  #bar button {
+    background: #444; color: #eee; border: 1px solid #666;
+    padding: 4px 12px; border-radius: 4px; cursor: pointer;
+  }
+  #bar button:disabled, #bar input:disabled, #bar select:disabled { opacity: 0.45; cursor: default; }
+  #bar input[type="color"] { width: 34px; height: 22px; padding: 0; border: 1px solid #666; background: #444; }
+  #legend {
+    display: none; gap: 14px; align-items: center; flex-wrap: wrap;
+    padding: 5px 12px; background: #1a1d24; color: #ccc; font-size: 12px;
+  }
+  #legend .swatch {
+    display: inline-block; width: 11px; height: 11px; border-radius: 2px;
+    margin-right: 5px; vertical-align: -1px;
+  }
+  #caption {
+    display: none; padding: 6px 12px; background: #14161c; color: #bbb;
+    font-size: 12px; line-height: 1.5;
+  }
+  #caption-title { color: #eee; font-size: 13px; font-weight: bold; }
+  #caption-note { color: #fc9; }
+  #caption-attr { color: #888; font-size: 11px; }
+  #graph { width: 100%; height: calc(100% - 45px); display: block; touch-action: none; }
+  #bench { color: #8f8; font-weight: bold; }
+  #err { color: #f66; white-space: pre-wrap; padding: 4px 12px; }
+  body.dragover #graph { outline: 3px dashed #8f8; outline-offset: -3px; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <button id="open">ファイルを開く</button>
+  <input id="file" type="file" accept=".json,.gexf,.graphml,.xml,.csv" hidden>
+  <button id="toggle">止める</button>
+  <button id="shuffle">散らす</button>
+  <span>表示
+    <button id="fitview">全体表示</button><button id="zoomin">＋</button><button id="zoomout">−</button> <span id="zoompct">100%</span>
+  </span>
+  <label>Scaling <input id="scaling" type="range" min="0.1" max="2" step="0.1" value="0.5"> <span id="scaling-val">0.5</span></label>
+  <label>Gravity <input id="gravity" type="range" min="0" max="4" step="0.05" value="1"> <span id="gravity-val">1.00</span></label>
+  <span>プリセット
+    <button data-preset="standard">標準</button><button data-preset="spread">広がり</button><button data-preset="compact">コンパクト</button>
+  </span>
+  <label>半径倍率 <input id="radius" type="range" min="0.25" max="4" step="0.05" value="1"> <span id="radius-val">1.00</span></label>
+  <label><input id="linkw" type="checkbox"> 太さを強度に連動</label>
+  <label><input id="hideneg" type="checkbox"> 負エッジを隠す</label>
+  <label><input id="images" type="checkbox" checked> ノード画像</label>
+  <label>画像LOD閾値 <input id="lod" type="range" min="4" max="64" step="1" value="14"> <span id="lod-val">14</span>px</label>
+  <label><input id="cropcircle" type="checkbox" checked> 画像を円で切り抜く</label>
+  <label>FPS上限
+    <select id="fpslimit">
+      <option value="0" selected>無制限</option>
+      <option value="60">60</option>
+      <option value="30">30</option>
+      <option value="15">15</option>
+    </select>
+  </label>
+  <button id="settle">静定まで計算</button>
+  <span id="settleinfo"></span>
+  <button id="svgexport">SVGで保存</button>
+  <button id="resolve">重なり解消</button>
+  <label><input id="resolveframe" type="checkbox"> 毎フレーム解消</label>
+  <span id="overlap">最大重なり: —</span>
+  <label>背景色 <input id="bgcolor" type="color" value="#101216"></label>
+  <span>背景
+    <button data-bg="#101216">暗</button><button data-bg="#ffffff">白</button><button data-bg="#e8e8e8">灰</button><button data-bg="#0b1e3a">紺</button>
+  </span>
+  <label>エッジ色
+    <select id="edgemode">
+      <option value="0" selected>固定色</option>
+      <option value="1">端点の色</option>
+      <option value="2">種別色</option>
+    </select>
+    <input id="edgecolor" type="color" value="#9eadc7">
+  </label>
+  <label><input id="arrows" type="checkbox"> 矢印を表示</label>
+  <span id="hud">loading…</span>
+  <span id="bench"></span>
+</div>
+<div id="legend"></div>
+<div id="caption">
+  <div id="caption-title"></div>
+  <div id="caption-desc"></div>
+  <div id="caption-note"></div>
+  <div id="caption-attr"></div>
+</div>
+<div id="err"></div>
+<canvas id="graph"></canvas>
+<script type="module">
+import init, { create_viewer, create_headless } from "./pkg/gpuatlas.js";
+import { buildAtlas, imageCellsFor, loadImageElement, renderImageCellPixelsSquare, writeCellPixels, ATLAS_COUNT } from "./atlas.mjs";
+import { parseGraphText, parseNativeJSON, typeColorHex, typeIndexOf } from "./data.mjs";
+
+// Page structure, data preparation, camera handling, HUD and bench
+// semantics mirror the WebGL2 version (../app/) so measurements are
+// comparable. The simulation and rendering run in Rust/wgpu (WebGPU);
+// this script only prepares typed arrays and forwards UI events.
+//
+// Usability chunk: the graph data is a normalized model (data.mjs)
+// — the bundled bench-data.json at startup, or a user file (native
+// JSON / GEXF / GraphML / CSV edge list) via the open button or
+// drag & drop. Loading a file rebuilds the viewer from the model.
+
+const params = new URLSearchParams(location.search);
+const BENCH = params.get("bench") === "1";
+const DISC_R = 100;
+
+// Settle mode ("compute until settled"): step-only batches of
+// 20 iterations in Rust, stopping when the measured mean
+// per-iteration displacement falls to SETTLE_THRESHOLD world
+// units or SETTLE_CAP iterations have run. The values come from
+// the measured decay curve at N=2,000 recorded in RESULTS.md
+// (displacement ~0.107 at iteration 280, ~0.016 at 1,000,
+// ~0.0117 at 1,200 and still falling).
+const SETTLE_THRESHOLD = 0.01;
+const SETTLE_CAP = 5000;
+
+// Parameter presets: [Scaling, Gravity, SPEED] bundles.
+const PRESETS = {
+  standard: [0.5, 1.0, 0.1],
+  spread: [1.2, 0.3, 0.1],
+  compact: [0.25, 2.5, 0.12],
+};
+
+const canvas = document.getElementById("graph");
+const hudEl = document.getElementById("hud");
+const benchEl = document.getElementById("bench");
+const errEl = document.getElementById("err");
+const legendEl = document.getElementById("legend");
+
+function fail(msg) {
+  errEl.textContent = "ERROR: " + msg;
+  document.title = "ERROR " + msg;
+  throw new Error(msg);
+}
+
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function communityColor(c) {
+  const h = ((c * 137.508) % 360) / 360;
+  const s = 0.65, l = 0.55;
+  const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+  const p = 2 * l - q;
+  const tc = (t) => {
+    if (t < 0) t += 1; if (t > 1) t -= 1;
+    if (t < 1 / 6) return p + (q - p) * 6 * t;
+    if (t < 1 / 2) return q;
+    if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
+    return p;
+  };
+  return [tc(h + 1 / 3), tc(h), tc(h - 1 / 3)];
+}
+
+function hexToRgb01(hex) {
+  const v = parseInt(hex.slice(1), 16);
+  return [((v >> 16) & 255) / 255, ((v >> 8) & 255) / 255, (v & 255) / 255];
+}
+
+function escHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+
+async function main() {
+  if (!navigator.gpu) fail("WebGPU (navigator.gpu) is not available in this browser.");
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) fail("WebGPU のアダプタが取得できませんでした。このブラウザ／環境では GPU が利用できないため動作しません。WebGPU 対応ブラウザ（Chrome / Edge 等）で開いてください。");
+  await init();
+  // Chunk-2 image LOD: atlas icons (canvas-generated, as in the
+  // WebGL2 version). The pristine generated atlas is built once;
+  // each dataset load starts from a copy of it and draws any real
+  // node images into cells on top (see prepareImages).
+  const atlasBase = buildAtlas();
+  let liveAtlasBytes = atlasBase.bytes;
+
+  // ---------- state ----------
+  let viewer = null;
+  let current = null; // normalized model (data.mjs)
+  let N = 0, E = 0;
+  let seed = 1234;
+  const settings = { scaling: 0.5, gravity: 1.0, speed: 0.1 };
+
+  // Size the canvas (the surface follows on the next frame).
+  function resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const w = Math.floor(canvas.clientWidth * dpr);
+    const h = Math.floor(canvas.clientHeight * dpr);
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w; canvas.height = h;
+      if (viewer) viewer.resize(w, h);
+    }
+    return dpr;
+  }
+
+  // ---------- model -> typed arrays ----------
+  function buildArrays(model, useFilePositions, imageCells) {
+    const n = model.nodes.length, e = model.edges.length;
+    const degree = new Uint32Array(n);
+    for (const ed of model.edges) { degree[ed.a]++; degree[ed.b]++; }
+    const offsets = new Uint32Array(n + 1);
+    for (let i = 0; i < n; i++) offsets[i + 1] = offsets[i] + degree[i];
+    const neighbors = new Uint32Array(offsets[n]);
+    const edgeStrengths = new Float32Array(offsets[n]);
+    const cursor = Uint32Array.from(offsets.subarray(0, n));
+    for (const ed of model.edges) {
+      neighbors[cursor[ed.a]] = ed.b; edgeStrengths[cursor[ed.a]++] = ed.strength;
+      neighbors[cursor[ed.b]] = ed.a; edgeStrengths[cursor[ed.b]++] = ed.strength;
+    }
+    // Per-edge render attributes (chunk 1 + usability chunk):
+    // (strength, width, directed, type index).
+    const edgePairs = new Uint32Array(e * 2);
+    const edgeAttrs = new Float32Array(e * 4);
+    model.edges.forEach((ed, i) => {
+      edgePairs[i * 2] = ed.a; edgePairs[i * 2 + 1] = ed.b;
+      edgeAttrs[i * 4] = ed.strength;
+      edgeAttrs[i * 4 + 1] = ed.width;
+      edgeAttrs[i * 4 + 2] = ed.directed ? 1 : 0;
+      edgeAttrs[i * 4 + 3] = typeIndexOf(model, ed);
+    });
+    const radii = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      radii[i] = model.nodes[i].radius !== undefined
+        ? model.nodes[i].radius
+        : 0.35 * Math.sqrt(degree[i] + 1);
+    }
+    const colors = new Float32Array(n * 4);
+    for (let i = 0; i < n; i++) {
+      const c = model.nodes[i].color || communityColor(model.nodes[i].community);
+      colors[i * 4] = c[0]; colors[i * 4 + 1] = c[1]; colors[i * 4 + 2] = c[2]; colors[i * 4 + 3] = 1;
+    }
+    // Positions: file x/y where the data carries them (unless a
+    // random scatter is requested), else the deterministic disc.
+    const rnd = mulberry32(seed);
+    const positions = new Float32Array(n * 4);
+    let fitRadius = 1;
+    for (let i = 0; i < n; i++) {
+      const node = model.nodes[i];
+      let x, y;
+      if (useFilePositions && Number.isFinite(node.x) && Number.isFinite(node.y)) {
+        x = node.x; y = node.y;
+      } else {
+        const r = DISC_R * Math.sqrt(rnd());
+        const th = rnd() * Math.PI * 2;
+        x = r * Math.cos(th); y = r * Math.sin(th);
+      }
+      positions[i * 4] = x;
+      positions[i * 4 + 1] = y;
+      positions[i * 4 + 2] = degree[i] + 1; // mass
+      positions[i * 4 + 3] = 1;
+      fitRadius = Math.max(fitRadius, Math.hypot(x, y));
+    }
+    return {
+      positions, colors, radii, offsets, neighbors, edgeStrengths,
+      edgePairs, edgeAttrs,
+      imageCells: imageCells || imageCellsFor(model.nodes),
+      fitRadius,
+    };
+  }
+
+  // ---------- camera (same interaction model as the WebGL2 version) ----------
+  const cam = { cx: 0, cy: 0, zoom: 3 };
+  // Zoom of the most recent fit — the initial fitCamera below, or
+  // a bounds fit (fitToBounds). The zoom indicator shows cam.zoom
+  // relative to this value: 100% means "fitted".
+  let fitZoom = cam.zoom;
+  const zoompctEl = document.getElementById("zoompct");
+  function updateZoomLabel() {
+    zoompctEl.textContent = `${Math.round((cam.zoom / fitZoom) * 100)}%`;
+  }
+  function fitCamera(fitRadius) {
+    resize();
+    cam.cx = 0; cam.cy = 0;
+    cam.zoom = (Math.min(canvas.width, canvas.height) / 2) / (fitRadius * 1.25);
+    fitZoom = cam.zoom;
+    updateZoomLabel();
+    if (BENCH) { cam.cx = 0; cam.cy = 0; } // fixed camera for the benchmark
+  }
+  window.__cam = cam;
+  // Test/inspection hook: a snapshot of the camera state.
+  window.__camera = () => ({ cx: cam.cx, cy: cam.cy, zoom: cam.zoom, fitZoom });
+
+  // Fit the camera to the LIVE positions: the GPU reduces them to
+  // centroid + max radius and only those three floats are read
+  // back (Viewer.layout_bounds); positions stay on the GPU. Runs
+  // through the runViewerOp gate like every async Viewer call. If
+  // the bounds readback fails in some environment (e.g. a
+  // presenting device that cannot map buffers), the current
+  // camera is kept and false is returned — never a page error.
+  // BENCH keeps its fixed camera. Defined before runViewerOp
+  // textually, but only ever called from handlers/timers after
+  // the whole module has run, so the gate is initialized by then.
+  const FIT_MARGIN = 1.15;
+  async function fitToBounds() {
+    if (BENCH || !viewer) return false;
+    const applied = await runViewerOp(async () => {
+      try {
+        const b = await viewer.layout_bounds();
+        if (!b || !Number.isFinite(b.cx + b.cy + b.radius)) return false;
+        resize();
+        cam.cx = b.cx; cam.cy = b.cy;
+        cam.zoom = Math.max(0.05, Math.min(300,
+          (Math.min(canvas.width, canvas.height) / 2) / (Math.max(b.radius, 1e-3) * FIT_MARGIN)));
+        fitZoom = cam.zoom;
+        updateZoomLabel();
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    return applied === true;
+  }
+  window.__fitToBounds = fitToBounds;
+
+  // Auto-fit while a freshly loaded layout settles: re-fit from
+  // the live bounds ~1s and ~3.5s after each dataset load, so the
+  // view follows the layout as it contracts from its scattered
+  // start (the initial fitCamera alone leaves it sparse). Any
+  // manual camera interaction cancels the pending re-fits for
+  // that dataset: the generation counter invalidates them and the
+  // timers are cleared.
+  let autoFitGen = 0;
+  let autoFitTimers = [];
+  function cancelAutoFit() {
+    autoFitGen++;
+    for (const t of autoFitTimers) clearTimeout(t);
+    autoFitTimers = [];
+  }
+  function scheduleAutoFit() {
+    cancelAutoFit();
+    if (BENCH) return;
+    const gen = autoFitGen;
+    for (const delay of [1000, 3500]) {
+      autoFitTimers.push(setTimeout(() => {
+        if (gen === autoFitGen) fitToBounds();
+      }, delay));
+    }
+  }
+
+  // Zoom by `factor` keeping the world point under (clientX,
+  // clientY) fixed — the wheel handler's math, shared with the
+  // pinch gesture and the zoom buttons.
+  function zoomAt(clientX, clientY, factor) {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const rect = canvas.getBoundingClientRect();
+    const px = (clientX - rect.left) * dpr, py = (clientY - rect.top) * dpr;
+    const wx = cam.cx + (px - canvas.width / 2) / cam.zoom;
+    const wy = cam.cy - (py - canvas.height / 2) / cam.zoom;
+    cam.zoom = Math.max(0.05, Math.min(300, cam.zoom * factor));
+    cam.cx = wx - (px - canvas.width / 2) / cam.zoom;
+    cam.cy = wy + (py - canvas.height / 2) / cam.zoom;
+    updateZoomLabel();
+  }
+
+  // Pointer tracking: one active pointer drags (pan); a second
+  // pointer switches to pinch — the distance ratio zooms around
+  // the midpoint and midpoint movement pans. Entering pinch
+  // cancels the single-pointer drag; dropping back to one pointer
+  // resumes the drag from that pointer's current position. The
+  // canvas has touch-action: none so touch gestures reach these
+  // handlers instead of the browser's own pan/zoom.
+  const pointers = new Map();
+  let drag = null;
+  let pinch = null;
+  canvas.addEventListener("pointerdown", (e) => {
+    cancelAutoFit();
+    // Capture keeps move events flowing outside the canvas; a
+    // synthetic pointer (tests) has no active pointer to capture.
+    try { canvas.setPointerCapture(e.pointerId); } catch { /* no active pointer */ }
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pointers.size === 1) {
+      drag = { x: e.clientX, y: e.clientY };
+      pinch = null;
+    } else if (pointers.size === 2) {
+      drag = null;
+      const [p1, p2] = [...pointers.values()];
+      pinch = {
+        d: Math.hypot(p1.x - p2.x, p1.y - p2.y),
+        x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2,
+      };
+    }
+  });
+  canvas.addEventListener("pointermove", (e) => {
+    if (!pointers.has(e.pointerId)) return;
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    if (pinch && pointers.size === 2) {
+      const [p1, p2] = [...pointers.values()];
+      const d = Math.hypot(p1.x - p2.x, p1.y - p2.y);
+      const mx = (p1.x + p2.x) / 2, my = (p1.y + p2.y) / 2;
+      if (pinch.d > 0 && d > 0) zoomAt(mx, my, d / pinch.d);
+      cam.cx -= ((mx - pinch.x) * dpr) / cam.zoom;
+      cam.cy += ((my - pinch.y) * dpr) / cam.zoom;
+      pinch = { d, x: mx, y: my };
+    } else if (drag && pointers.size === 1) {
+      cam.cx -= ((e.clientX - drag.x) * dpr) / cam.zoom;
+      cam.cy += ((e.clientY - drag.y) * dpr) / cam.zoom;
+      drag = { x: e.clientX, y: e.clientY };
+    }
+  });
+  function endPointer(e) {
+    if (!pointers.delete(e.pointerId)) return;
+    if (pointers.size < 2) pinch = null;
+    if (pointers.size === 1) {
+      const [p] = [...pointers.values()];
+      drag = { x: p.x, y: p.y };
+    } else {
+      drag = null;
+    }
+  }
+  canvas.addEventListener("pointerup", endPointer);
+  canvas.addEventListener("pointercancel", endPointer);
+  canvas.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    cancelAutoFit();
+    zoomAt(e.clientX, e.clientY, Math.exp(-e.deltaY * 0.0015));
+  }, { passive: false });
+
+  // ---------- async Viewer operations: page-level mutual exclusion ----------
+  // wasm-bindgen guards the Viewer object with a borrow flag. The
+  // async methods — resolve_overlaps (&mut self), export_svg,
+  // settle and readback_positions — hold that borrow across every
+  // await inside them, so ANY other Viewer call in that window
+  // throws "recursive use of an object detected which would lead to
+  // unsafe aliasing in rust". runViewerOp is the single gate for
+  // every async Viewer call (and for viewer rebuilds): the busy
+  // flag is set synchronously, before the first await, so no rAF
+  // callback or event handler can interleave; while it is set the
+  // loop skips frame() and every bar control is disabled. A second
+  // call while busy returns undefined instead of touching the
+  // Viewer.
+  let viewerBusy = false;
+  function setViewerControlsEnabled(enabled) {
+    for (const el of document.querySelectorAll("#bar button, #bar input, #bar select")) {
+      el.disabled = !enabled;
+    }
+  }
+  async function runViewerOp(fn) {
+    if (viewerBusy) return undefined;
+    viewerBusy = true;
+    setViewerControlsEnabled(false);
+    try {
+      return await fn();
+    } finally {
+      viewerBusy = false;
+      setViewerControlsEnabled(true);
+    }
+  }
+
+  // ---------- real node images ----------
+  // A node's `imageUrl` (see data.mjs) names a real image file.
+  // The unique URLs are loaded once per dataset and drawn into
+  // atlas cells as full squares; the circular crop (and its
+  // white ring) is applied by the fragment shader behind the
+  // crop toggle, so switching between circular and square node
+  // images never re-bakes the atlas (see atlas.mjs). The
+  // affected nodes are then pointed at those cells. Anything
+  // that cannot be loaded falls back to the generated icon the
+  // node would have had anyway:
+  // a relative URL with no base (file-picker loads), a network
+  // or decode failure, a tainted canvas, or more unique images
+  // than the atlas has free cells (noted on the page).
+  function resolveImageUrl(raw, baseUrl) {
+    if (/^(?:https?:|data:|blob:)/i.test(raw)) return raw;
+    if (!baseUrl) return null;
+    try { return new URL(raw, baseUrl).href; } catch { return null; }
+  }
+
+  async function prepareImages(model, baseUrl) {
+    const n = model.nodes.length;
+    const bytes = new Uint8Array(atlasBase.bytes);
+    const base = imageCellsFor(model.nodes);
+    const cells = new Uint32Array(n);
+    const urlIndex = new Map();
+    const urls = [];
+    for (const node of model.nodes) {
+      if (node.imageUrl && !urlIndex.has(node.imageUrl)) {
+        urlIndex.set(node.imageUrl, urls.length);
+        urls.push(node.imageUrl);
+      }
+    }
+    if (urls.length === 0) {
+      for (let i = 0; i < n; i++) cells[i] = base[i];
+      return { cells, bytes, note: "" };
+    }
+    // Cells already claimed by generated icons / explicit cell
+    // indices stay untouched; image cells take the lowest free
+    // ones, so a photo never overwrites an icon in use.
+    const used = new Set();
+    for (let i = 0; i < n; i++) if (!model.nodes[i].imageUrl) used.add(base[i]);
+    const cellOfUrl = new Array(urls.length).fill(-1);
+    let scan = 0;
+    for (let u = 0; u < urls.length; u++) {
+      while (scan < ATLAS_COUNT && used.has(scan)) scan++;
+      if (scan >= ATLAS_COUNT) break;
+      cellOfUrl[u] = scan;
+      used.add(scan);
+      scan++;
+    }
+    const drawn = new Set();
+    await Promise.all(urls.map(async (raw, u) => {
+      if (cellOfUrl[u] < 0) return;
+      const url = resolveImageUrl(raw, baseUrl);
+      if (!url) return;
+      const img = await loadImageElement(url);
+      if (!img) return;
+      const pixels = renderImageCellPixelsSquare(img);
+      if (!pixels) return;
+      writeCellPixels(bytes, cellOfUrl[u], pixels);
+      drawn.add(cellOfUrl[u]);
+    }));
+    for (let i = 0; i < n; i++) {
+      const node = model.nodes[i];
+      if (!node.imageUrl) { cells[i] = base[i]; continue; }
+      const cell = cellOfUrl[urlIndex.get(node.imageUrl)];
+      if (cell >= 0 && drawn.has(cell)) { cells[i] = cell; continue; }
+      // Fallback: the generated cell — unless a drawn photo took
+      // it, in which case take the first cell no photo uses.
+      let c = base[i];
+      if (drawn.has(c)) {
+        c = 0;
+        while (c < ATLAS_COUNT && drawn.has(c)) c++;
+        if (c >= ATLAS_COUNT) c = base[i];
+      }
+      cells[i] = c;
+    }
+    const note = cellOfUrl.some((c) => c < 0)
+      ? `画像が ${urls.length} 件あり、アトラスの上限（${ATLAS_COUNT} セル）を超えたため、一部のノードは生成アイコンで表示しています`
+      : "";
+    return { cells, bytes, note };
+  }
+
+  // ---------- dataset caption (meta) ----------
+  const captionEl = document.getElementById("caption");
+  const captionTitleEl = document.getElementById("caption-title");
+  const captionDescEl = document.getElementById("caption-desc");
+  const captionNoteEl = document.getElementById("caption-note");
+  const captionAttrEl = document.getElementById("caption-attr");
+  function updateCaption(model, note) {
+    const meta = model.meta || {};
+    const set = (el, text) => {
+      el.textContent = text || "";
+      el.style.display = text ? "" : "none";
+    };
+    set(captionTitleEl, meta.title);
+    set(captionDescEl, meta.description);
+    set(captionNoteEl, note);
+    set(captionAttrEl, meta.attribution);
+    captionEl.style.display =
+      (meta.title || meta.description || meta.attribution || note) ? "block" : "none";
+  }
+
+  // ---------- viewer lifecycle ----------
+  const scalingEl = document.getElementById("scaling");
+  const scalingVal = document.getElementById("scaling-val");
+  const gravityEl = document.getElementById("gravity");
+  const gravityVal = document.getElementById("gravity-val");
+  const radiusEl = document.getElementById("radius");
+  const radiusVal = document.getElementById("radius-val");
+  const arrowsEl = document.getElementById("arrows");
+
+  function applySettings(v) {
+    v.set_scaling(settings.scaling);
+    v.set_gravity(settings.gravity);
+    v.set_speed(settings.speed);
+    v.set_radius_scale(Number(radiusEl.value));
+    v.set_link_width(document.getElementById("linkw").checked);
+    v.set_hide_negative(document.getElementById("hideneg").checked);
+    v.set_images_enabled(document.getElementById("images").checked);
+    v.set_lod_px(Number(document.getElementById("lod").value));
+    v.set_crop_circle(document.getElementById("cropcircle").checked);
+    v.set_resolve_per_frame(document.getElementById("resolveframe").checked);
+    const [br, bg, bb] = hexToRgb01(document.getElementById("bgcolor").value);
+    v.set_background(br, bg, bb);
+    v.set_edge_mode(Number(document.getElementById("edgemode").value));
+    const [er, eg, eb] = hexToRgb01(document.getElementById("edgecolor").value);
+    v.set_edge_color(er, eg, eb);
+    applyArrows(v);
+    if (params.get("repulsion") === "direct") v.set_direct_repulsion(true);
+  }
+
+  function applyArrows(v) {
+    // Arrows show on directed edges; when the data marks no edge
+    // as directed, the toggle treats every edge as directed
+    // (a -> b in file order).
+    const on = arrowsEl.checked;
+    v.set_arrows(on, on && !(current && current.directed));
+  }
+
+  function updateLegend() {
+    if (!current || current.types.length === 0) {
+      legendEl.style.display = "none";
+      legendEl.innerHTML = "";
+      return;
+    }
+    const counts = new Array(current.types.length).fill(0);
+    for (const ed of current.edges) {
+      const ti = typeIndexOf(current, ed);
+      if (ti >= 0) counts[ti]++;
+    }
+    legendEl.style.display = "flex";
+    legendEl.innerHTML = current.types
+      .map((t, i) => `<span><span class="swatch" style="background:${typeColorHex(i)}"></span>${escHtml(t)} (${counts[i]})</span>`)
+      .join("");
+  }
+
+  let frames = 0, iters = 0;
+  let totalFrames = 0, totalIters = 0;
+  let benchStart = null, benchDone = false;
+  let currentArrays = null; // arrays of the live viewer (restore path)
+
+  // Creating a viewer asks the browser for a fresh WebGPU surface
+  // on the page's canvas. Right after the previous viewer is freed
+  // that hand-over is not instantaneous in every implementation —
+  // under Chromium + SwiftShader a same-tick re-creation can fail
+  // adapter acquisition ("A valid external Instance reference no
+  // longer exists", the presenting-device instability recorded in
+  // RESULTS.md). Retry with a short backoff; it costs nothing on
+  // the first-attempt success path.
+  async function createViewerWithRetry(arrays, bytes) {
+    let lastErr;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        return await create_viewer(
+          canvas, arrays.positions, arrays.colors, arrays.radii,
+          arrays.offsets, arrays.neighbors, arrays.edgeStrengths,
+          arrays.edgePairs, arrays.edgeAttrs, arrays.imageCells, bytes,
+        );
+      } catch (e) {
+        lastErr = e;
+        await new Promise((r) => setTimeout(r, 300 * (attempt + 1)));
+      }
+    }
+    throw lastErr;
+  }
+
+  async function startViewer(model, baseUrl = null) {
+    return runViewerOp(async () => {
+      const prepared = await prepareImages(model, baseUrl);
+      const arrays = buildArrays(model, true, prepared.cells);
+      const oldModel = current, oldArrays = currentArrays;
+      if (viewer) {
+        try { viewer.free(); } catch { /* already gone */ }
+        viewer = null;
+      }
+      // Let the browser release the freed viewer's canvas surface
+      // before the new one is created on the same canvas.
+      await new Promise((r) => setTimeout(r, 60));
+      let v;
+      try {
+        v = await createViewerWithRetry(arrays, prepared.bytes);
+      } catch (e) {
+        // A failed load must not leave a dead page: rebuild the
+        // previous graph (its arrays are cached) and only then
+        // surface the error.
+        if (oldModel && oldArrays) {
+          try {
+            viewer = await createViewerWithRetry(oldArrays, liveAtlasBytes);
+            window.__viewer = viewer;
+            applySettings(viewer);
+            fitCamera(oldArrays.fitRadius);
+          } catch { /* restore failed too; the error below stands */ }
+        }
+        throw e;
+      }
+      viewer = v;
+      window.__viewer = viewer;
+      liveAtlasBytes = prepared.bytes;
+      currentArrays = arrays;
+      current = model;
+      N = model.nodes.length; E = model.edges.length;
+      applySettings(viewer);
+      arrowsEl.checked = model.directed;
+      applyArrows(viewer);
+      fitCamera(arrays.fitRadius);
+      frames = 0; iters = 0; totalFrames = 0; totalIters = 0;
+      benchStart = null; benchDone = false;
+      window.__stats.iters = 0;
+      window.__stats.frames = 0;
+      window.__stats.n = N;
+      window.__stats.e = E;
+      updateLegend();
+      updateCaption(model, prepared.note);
+      hudEl.textContent = `${N.toLocaleString()} nodes / ${E.toLocaleString()} edges`;
+      // Follow the layout as it contracts from its scattered
+      // start: re-fit from the live bounds at ~1s and ~3.5s
+      // (cancelled by any manual camera interaction).
+      scheduleAutoFit();
+    });
+  }
+
+  // ---------- data loading ----------
+  async function handleFile(file) {
+    if (viewerBusy) return;
+    try {
+      const text = await file.text();
+      const model = parseGraphText(text, file.name);
+      errEl.textContent = "";
+      await startViewer(model);
+    } catch (e) {
+      errEl.textContent = "データの読み込みに失敗しました: " + (e && e.message ? e.message : String(e));
+    }
+  }
+  const fileInput = document.getElementById("file");
+  document.getElementById("open").addEventListener("click", () => fileInput.click());
+  fileInput.addEventListener("change", () => {
+    const f = fileInput.files && fileInput.files[0];
+    fileInput.value = "";
+    if (f) handleFile(f);
+  });
+  window.addEventListener("dragover", (e) => {
+    e.preventDefault();
+    document.body.classList.add("dragover");
+  });
+  window.addEventListener("dragleave", (e) => {
+    if (e.relatedTarget === null) document.body.classList.remove("dragover");
+  });
+  window.addEventListener("drop", (e) => {
+    e.preventDefault();
+    document.body.classList.remove("dragover");
+    const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) handleFile(f);
+  });
+
+  // Default data: the bundled benchmark graph (native JSON), or
+  // the dataset named by ?data=<url> (any supported format; image
+  // URLs inside it resolve against the data file's own URL). The
+  // historical ?limit= slicing applies to whichever model loaded.
+  const initialUrl = params.get("data") || "../bench-data.json";
+  const resp = await fetch(initialUrl);
+  if (!resp.ok) fail(`${initialUrl} fetch failed: ` + resp.status);
+  const initialModel = parseGraphText(await resp.text(), initialUrl.split(/[?#]/)[0]);
+  const limitParam = Number(params.get("limit") || 0);
+  if (limitParam > 0 && limitParam < initialModel.nodes.length) {
+    initialModel.nodes = initialModel.nodes.slice(0, limitParam);
+    initialModel.edges = initialModel.edges.filter((ed) => ed.a < limitParam && ed.b < limitParam);
+  }
+  window.__stats = { iters: 0, frames: 0, n: 0, e: 0 };
+  await startViewer(initialModel, new URL(initialUrl, location.href).href);
+
+  // ---------- controls ----------
+  let running = true;
+  const toggleBtn = document.getElementById("toggle");
+  toggleBtn.addEventListener("click", () => {
+    running = !running;
+    toggleBtn.textContent = running ? "止める" : "回す";
+  });
+  document.getElementById("shuffle").addEventListener("click", () => {
+    seed += 1;
+    if (viewer && current) viewer.reset_positions(buildArrays(current, false).positions);
+  });
+  // Camera controls: fit to the live layout bounds, and step
+  // zoom around the view center. All three count as manual
+  // camera interaction, so they cancel pending auto-fits.
+  document.getElementById("fitview").addEventListener("click", () => {
+    cancelAutoFit();
+    fitToBounds();
+  });
+  function zoomButton(factor) {
+    cancelAutoFit();
+    const rect = canvas.getBoundingClientRect();
+    zoomAt(rect.left + rect.width / 2, rect.top + rect.height / 2, factor);
+  }
+  document.getElementById("zoomin").addEventListener("click", () => zoomButton(1.3));
+  document.getElementById("zoomout").addEventListener("click", () => zoomButton(1 / 1.3));
+  scalingEl.addEventListener("input", () => {
+    settings.scaling = Number(scalingEl.value);
+    scalingVal.textContent = settings.scaling.toFixed(1);
+    if (viewer) viewer.set_scaling(settings.scaling);
+  });
+  gravityEl.addEventListener("input", () => {
+    settings.gravity = Number(gravityEl.value);
+    gravityVal.textContent = settings.gravity.toFixed(2);
+    if (viewer) viewer.set_gravity(settings.gravity);
+  });
+  for (const btn of document.querySelectorAll("[data-preset]")) {
+    btn.addEventListener("click", () => {
+      const [s, g, sp] = PRESETS[btn.dataset.preset];
+      settings.scaling = s; settings.gravity = g; settings.speed = sp;
+      scalingEl.value = String(s);
+      scalingVal.textContent = s.toFixed(1);
+      gravityEl.value = String(g);
+      gravityVal.textContent = g.toFixed(2);
+      if (viewer) {
+        viewer.set_scaling(s);
+        viewer.set_gravity(g);
+        viewer.set_speed(sp);
+      }
+    });
+  }
+  radiusEl.addEventListener("input", () => {
+    radiusVal.textContent = Number(radiusEl.value).toFixed(2);
+    if (viewer) viewer.set_radius_scale(Number(radiusEl.value));
+  });
+  document.getElementById("linkw").addEventListener("change", (e) => {
+    if (viewer) viewer.set_link_width(e.target.checked);
+  });
+  document.getElementById("hideneg").addEventListener("change", (e) => {
+    if (viewer) viewer.set_hide_negative(e.target.checked);
+  });
+  document.getElementById("images").addEventListener("change", (e) => {
+    if (viewer) viewer.set_images_enabled(e.target.checked);
+  });
+  document.getElementById("cropcircle").addEventListener("change", (e) => {
+    if (viewer) viewer.set_crop_circle(e.target.checked);
+  });
+  const lodEl = document.getElementById("lod");
+  const lodVal = document.getElementById("lod-val");
+  lodEl.addEventListener("input", () => {
+    lodVal.textContent = lodEl.value;
+    if (viewer) viewer.set_lod_px(Number(lodEl.value));
+  });
+  let fpsLimit = 0;
+  document.getElementById("fpslimit").addEventListener("change", (e) => {
+    fpsLimit = Number(e.target.value);
+  });
+  const bgEl = document.getElementById("bgcolor");
+  function applyBackground() {
+    const [r, g, b] = hexToRgb01(bgEl.value);
+    canvas.style.background = bgEl.value;
+    if (viewer) viewer.set_background(r, g, b);
+  }
+  bgEl.addEventListener("input", applyBackground);
+  for (const btn of document.querySelectorAll("[data-bg]")) {
+    btn.addEventListener("click", () => {
+      bgEl.value = btn.dataset.bg;
+      applyBackground();
+    });
+  }
+  document.getElementById("edgemode").addEventListener("change", (e) => {
+    if (viewer) viewer.set_edge_mode(Number(e.target.value));
+  });
+  document.getElementById("edgecolor").addEventListener("input", (e) => {
+    if (!viewer) return;
+    const [r, g, b] = hexToRgb01(e.target.value);
+    viewer.set_edge_color(r, g, b);
+  });
+  arrowsEl.addEventListener("change", () => {
+    if (viewer) applyArrows(viewer);
+  });
+  document.getElementById("resolveframe").addEventListener("change", (e) => {
+    if (viewer) viewer.set_resolve_per_frame(e.target.checked);
+  });
+
+  // Chunk-2: lossless SVG export of the current layout. The string
+  // is kept on window.__lastSvg (verification hook) and downloaded
+  // as a file. On a presenting device under Chromium + SwiftShader
+  // the internal readback fails (see RESULTS.md); the same Rust code
+  // path is verified offscreen in test2.html.
+  async function exportSvgNow(download) {
+    return runViewerOp(async () => {
+      const svg = await viewer.export_svg();
+      window.__lastSvg = svg;
+      if (download) {
+        const blob = new Blob([svg], { type: "image/svg+xml" });
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = "gpuatlas-layout.svg";
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+      }
+      return svg;
+    });
+  }
+  window.__exportSvg = () => exportSvgNow(false);
+  document.getElementById("svgexport").addEventListener("click", async () => {
+    try {
+      await exportSvgNow(true);
+    } catch (e) {
+      errEl.textContent = "SVG export failed: " + e;
+    }
+  });
+
+  // Usability chunk: settle mode. Step-only batches in Rust (no
+  // rendering) until the measured mean per-iteration displacement
+  // reaches SETTLE_THRESHOLD or SETTLE_CAP iterations have run;
+  // the outcome — including a cap hit — is shown verbatim. On a
+  // presenting device under Chromium + SwiftShader the internal
+  // readbacks fail (see RESULTS.md); the same Rust code path is
+  // verified offscreen in test4.html.
+  const settleEl = document.getElementById("settleinfo");
+  async function settleNow() {
+    return runViewerOp(async () => {
+      settleEl.textContent = "静定: 計算中…";
+      try {
+        const rep = await viewer.settle(SETTLE_CAP, SETTLE_THRESHOLD);
+        window.__settleReport = rep;
+        settleEl.textContent = rep.converged
+          ? `静定: ${rep.iterations} 反復で平均移動量 ${rep.final_mean_displacement.toExponential(2)}（閾値 ${SETTLE_THRESHOLD} 以下に到達）`
+          : `静定: 上限 ${rep.iterations} 反復で平均移動量 ${rep.final_mean_displacement.toExponential(2)}（閾値 ${SETTLE_THRESHOLD} に未到達）`;
+        return rep;
+      } catch (e) {
+        settleEl.textContent = "静定: 失敗しました";
+        throw e;
+      }
+    });
+  }
+  window.__settle = settleNow;
+  document.getElementById("settle").addEventListener("click", async () => {
+    try {
+      await settleNow();
+    } catch (e) {
+      errEl.textContent = "settle failed: " + e;
+    }
+  });
+
+  // Chunk-3: overlap resolution. The button runs the guarantee
+  // path in Rust: measured correction rounds until the measured
+  // maximum overlap is <= 0.001 (world units) or 200 rounds have
+  // run; the outcome — including a cap hit with residual overlap —
+  // is shown verbatim next to the button.
+  const overlapEl = document.getElementById("overlap");
+  const fmtOv = (v) => (v === 0 ? "0" : v.toPrecision(3));
+  async function resolveNow() {
+    return runViewerOp(async () => {
+      overlapEl.textContent = "最大重なり: 解消中…";
+      try {
+        const rep = await viewer.resolve_overlaps();
+        window.__overlapReport = rep;
+        overlapEl.textContent = rep.converged
+          ? `最大重なり: ${fmtOv(rep.after_max)}（解消前 ${fmtOv(rep.before_max)}、許容超えペア ${rep.before_pairs} → ${rep.after_pairs}、${rep.rounds}ラウンドで許容 0.001 以下に到達）`
+          : `最大重なり: ${fmtOv(rep.after_max)}（解消前 ${fmtOv(rep.before_max)}、許容超えペア ${rep.before_pairs} → ${rep.after_pairs}、上限 ${rep.rounds} ラウンドで未収束・残存あり）`;
+        return rep;
+      } catch (e) {
+        overlapEl.textContent = "最大重なり: —（解消に失敗しました）";
+        throw e;
+      }
+    });
+  }
+  window.__resolveOverlaps = resolveNow;
+  document.getElementById("resolve").addEventListener("click", async () => {
+    try {
+      await resolveNow();
+    } catch (e) {
+      errEl.textContent = "overlap resolution failed: " + e;
+    }
+  });
+
+  // Verification hooks (same metrics as the WebGL2 version's __readback).
+  window.__positions = async () => runViewerOp(async () => {
+    const buf = await viewer.readback_positions();
+    const out = new Array(N);
+    for (let i = 0; i < N; i++) out[i] = [buf[i * 4], buf[i * 4 + 1], current.nodes[i].community];
+    return out;
+  });
+  function summarize(buf) {
+    const comms = new Map();
+    let gx = 0, gy = 0, mr = 0;
+    for (let i = 0; i < N; i++) {
+      const x = buf[i * 4], y = buf[i * 4 + 1];
+      gx += x; gy += y; mr += Math.hypot(x, y);
+      const c = current.nodes[i].community;
+      if (!comms.has(c)) comms.set(c, { x: 0, y: 0, n: 0 });
+      const o = comms.get(c); o.x += x; o.y += y; o.n++;
+    }
+    gx /= N; gy /= N; mr /= N;
+    let own = 0, glob = 0;
+    for (let i = 0; i < N; i++) {
+      const x = buf[i * 4], y = buf[i * 4 + 1];
+      const o = comms.get(current.nodes[i].community);
+      own += Math.hypot(x - o.x / o.n, y - o.y / o.n);
+      glob += Math.hypot(x - gx, y - gy);
+    }
+    return { meanRadius: mr, ownCentroid: own / N, globalCentroid: glob / N, ratio: (own / N) / (glob / N) };
+  }
+  window.__readback = async () => runViewerOp(async () => summarize(await viewer.readback_positions()));
+
+  // ---------- HUD / bench ----------
+  let lastHud = performance.now();
+  let lastFrameAt = 0;
+  hudEl.textContent = `${N.toLocaleString()} nodes / ${E.toLocaleString()} edges`;
+
+  function loop(now) {
+    if (viewerBusy || !viewer) {
+      // An async Viewer operation holds the wasm-bindgen borrow
+      // (see runViewerOp): frame() here would throw "recursive use
+      // of an object". Freeze the picture until the operation
+      // settles and clears the flag; rendering resumes next frame.
+      requestAnimationFrame(loop);
+      return;
+    }
+    if (fpsLimit > 0 && now - lastFrameAt < 1000 / fpsLimit) {
+      // FPS cap: sit this tick out (simulation and rendering are
+      // capped together, one iteration per drawn frame as always).
+      requestAnimationFrame(loop);
+      return;
+    }
+    lastFrameAt = now;
+    const dpr = resize();
+    if (running) iters++, totalIters++;
+    viewer.frame(cam.cx, cam.cy, cam.zoom, dpr, running);
+    frames++; totalFrames++;
+    window.__stats.iters = totalIters;
+    window.__stats.frames = totalFrames;
+    if (benchStart === null) benchStart = now;
+    if (now - lastHud >= 500) {
+      const dt = (now - lastHud) / 1000;
+      const fps = frames / dt, ips = iters / dt;
+      const fmt = (v) => (v < 9.95 ? v.toFixed(2) : v.toFixed(1));
+      hudEl.textContent =
+        `fps ${fmt(fps)} / iter ${fmt(ips)}/s / ` +
+        `${N.toLocaleString()} nodes / ${E.toLocaleString()} edges / ` +
+        `Scaling ${settings.scaling.toFixed(1)} / Gravity ${settings.gravity.toFixed(2)}`;
+      updateZoomLabel();
+      frames = 0; iters = 0; lastHud = now;
+    }
+    if (BENCH && !benchDone && now - benchStart >= 10000) {
+      benchDone = true;
+      const secs = (now - benchStart) / 1000;
+      const msg = `BENCH iterations=${totalIters} fps=${(totalFrames / secs).toFixed(1)}`;
+      document.title = msg;
+      benchEl.textContent = msg;
+    }
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+}
+
+main().catch((e) => {
+  if (!errEl.textContent) {
+    let msg = e && e.message ? String(e.message) : String(e);
+    if (!msg || msg === "undefined" || msg === "[object Object]") {
+      msg = "初期化に失敗しました（詳細不明のエラー）";
+    }
+    errEl.textContent = "ERROR: " + msg;
+  }
+  console.error(e);
+});
+</script>
+</body>
+</html>
